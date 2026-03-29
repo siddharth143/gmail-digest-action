@@ -1,0 +1,37 @@
+name: Daily Gmail digest
+
+on:
+  schedule:
+    # 09:00 IST (UTC+5:30) → 03:30 UTC
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    # One GitHub Actions secret per key in .env.example (same name as the env var).
+    env:
+      GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+      GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+      GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+      GMAIL_LABELS: ${{ secrets.GMAIL_LABELS }}
+      DATE_WINDOW_DAYS: ${{ secrets.DATE_WINDOW_DAYS }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+      SUMMARISATION_PERSONA: ${{ secrets.SUMMARISATION_PERSONA }}
+      FILTER_KEYWORDS: ${{ secrets.FILTER_KEYWORDS }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      MAX_EMAILS_PER_LABEL: ${{ secrets.MAX_EMAILS_PER_LABEL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run digest
+        run: python src/digest.py
