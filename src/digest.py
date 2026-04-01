@@ -38,6 +38,12 @@ class ScoredSummary:
     urgency: str  # High | Medium | Low
 
 
+@dataclass(frozen=True)
+class GmailLabel:
+    id: str
+    name: str
+
+
 def _slack_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -111,14 +117,32 @@ def _gmail_credentials(cfg: dict[str, Any]) -> Credentials:
     return creds
 
 
-def _label_id_by_name(service: Any, name: str) -> str:
+def _list_gmail_labels(service: Any) -> list[GmailLabel]:
     resp = service.users().labels().list(userId="me").execute()
-    want = name.strip().lower()
+    out: list[GmailLabel] = []
     for lab in resp.get("labels", []):
-        if (lab.get("name") or "").lower() == want:
-            return lab["id"]
-    print(f"Gmail label not found: {name!r}", file=sys.stderr)
-    raise SystemExit(1)
+        lid = (lab.get("id") or "").strip()
+        name = (lab.get("name") or "").strip()
+        if lid and name:
+            out.append(GmailLabel(id=lid, name=name))
+    return out
+
+
+def _expand_label_family(labels: list[GmailLabel], parent_name: str) -> list[GmailLabel]:
+    """
+    Gmail supports hierarchical labels with '/' separators.
+    If parent_name is 'AI Product Management', include:
+      - 'AI Product Management'
+      - 'AI Product Management/...'
+    """
+    want = parent_name.strip()
+    if not want:
+        return []
+    want_l = want.lower()
+    prefix_l = want_l + "/"
+    family = [l for l in labels if l.name.lower() == want_l or l.name.lower().startswith(prefix_l)]
+    family.sort(key=lambda x: x.name.lower())
+    return family
 
 
 def _header(headers: list[dict[str, str]], want: str) -> str:
@@ -311,7 +335,7 @@ def _gmail_open_url(thread_id: str) -> str:
 
 
 def _build_blocks(
-    label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary]]]],
+    label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary, str]]]],
     *,
     tldr_lines: list[str] | None = None,
     block_budget: int = 45,
@@ -350,7 +374,7 @@ def _build_blocks(
             continue
 
         omitted = 0
-        for idx, (item, scored) in enumerate(rows):
+        for idx, (item, scored, source_label) in enumerate(rows):
             if used + 1 > block_budget:
                 omitted = len(rows) - idx
                 break
@@ -360,6 +384,7 @@ def _build_blocks(
                 f"*Subject:* {_slack_escape(item.subject)}\n"
                 f"*From:* {_slack_escape(item.from_addr)}\n"
                 f"*Date:* {_slack_escape(item.date)}\n\n"
+                f"*Sublabel:* {_slack_escape(source_label)}\n\n"
                 f"*Relevance:* {scored.relevance}/5   *Urgency:* {urgency_dot} {scored.urgency}\n\n"
                 f"{_slack_escape(scored.summary)}\n\n"
                 f"<{url}|Open in Gmail>"
@@ -458,52 +483,66 @@ def main() -> int:
         print(f"Gemini model init failed: {e}", file=sys.stderr)
         return 1
 
-    label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary]]]] = []
+    try:
+        all_labels = _list_gmail_labels(service)
+    except HttpError as e:
+        print(f"Gmail API error listing labels: {e}", file=sys.stderr)
+        return 1
+
+    label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary, str]]]] = []
     all_scored: list[tuple[str, EmailItem, ScoredSummary]] = []
 
-    for label_name in cfg["labels"]:
-        try:
-            label_id = _label_id_by_name(service, label_name)
-            _debug(f"[gmail] resolved label {label_name!r} -> {label_id!r}")
-            q = f"newer_than:{cfg['date_window_days']}d"
-            refs = _list_message_refs(
-                service,
-                label_id,
-                q=q,
-                max_count=cfg["max_emails_per_label"],
-            )
-        except HttpError as e:
-            print(f"Gmail API error for label {label_name!r}: {e}", file=sys.stderr)
+    for parent_label in cfg["labels"]:
+        family = _expand_label_family(all_labels, parent_label)
+        if not family:
+            print(f"Gmail label not found: {parent_label!r}", file=sys.stderr)
             return 1
 
-        rows: list[tuple[EmailItem, ScoredSummary]] = []
-        fetched = len(refs)
+        remaining = cfg["max_emails_per_label"]
+        q = f"newer_than:{cfg['date_window_days']}d"
+        refs_with_source: list[tuple[dict[str, str], str]] = []
+
+        for lab in family:
+            if remaining <= 0:
+                break
+            _debug(f"[gmail] resolved label {lab.name!r} -> {lab.id!r} (parent {parent_label!r})")
+            try:
+                refs = _list_message_refs(service, lab.id, q=q, max_count=remaining)
+            except HttpError as e:
+                print(f"Gmail API error for label {lab.name!r}: {e}", file=sys.stderr)
+                return 1
+            refs_with_source.extend((r, lab.name) for r in refs)
+            remaining -= len(refs)
+
+        rows: list[tuple[EmailItem, ScoredSummary, str]] = []
+        fetched = len(refs_with_source)
         keyword_filtered = 0
         gemini_skipped = 0
         kept = 0
-        # If we fetched nothing, do a fast sanity check: does the label contain ANY mail?
-        # This helps distinguish "date window too small" vs "label has no messages".
+
         if fetched == 0:
             try:
-                any_refs = _list_message_refs(
-                    service,
-                    label_id,
-                    q=None,
-                    max_count=1,
-                )
+                any_in_family = False
+                for lab in family:
+                    any_refs = _list_message_refs(service, lab.id, q=None, max_count=1)
+                    if any_refs:
+                        any_in_family = True
+                        break
                 print(
                     "[label-check] "
-                    + f"{label_name!r}: any_in_label={bool(any_refs)} (no date filter)",
+                    + f"{parent_label!r}: any_in_label_family={any_in_family} (no date filter, includes sublabels)",
                     file=sys.stderr,
                 )
             except HttpError as e:
-                print(f"Gmail API error during label-check for {label_name!r}: {e}", file=sys.stderr)
+                print(f"Gmail API error during label-check for {parent_label!r}: {e}", file=sys.stderr)
                 return 1
 
-        for ref in refs:
+        seen_msg_ids: set[str] = set()
+        for ref, source_label_name in refs_with_source:
             mid = ref.get("id")
-            if not mid:
+            if not mid or mid in seen_msg_ids:
                 continue
+            seen_msg_ids.add(mid)
             try:
                 item = _fetch_email_item(service, mid)
             except HttpError as e:
@@ -518,17 +557,17 @@ def main() -> int:
                 gemini_skipped += 1
                 _debug(f"[gemini] SKIP: {item.subject!r}")
                 continue
-            rows.append((item, scored))
-            all_scored.append((label_name, item, scored))
+            rows.append((item, scored, source_label_name))
+            all_scored.append((parent_label, item, scored))
             kept += 1
 
-        # Always log aggregate counts (safe, no secrets) so Actions logs explain empty digests.
         print(
             "[label] "
-            + f"{label_name!r}: fetched={fetched} keyword_filtered={keyword_filtered} gemini_skipped={gemini_skipped} kept={kept}",
+            + f"{parent_label!r}: fetched={fetched} keyword_filtered={keyword_filtered} gemini_skipped={gemini_skipped} kept={kept} "
+            + f"labels_included={len(family)}",
             file=sys.stderr,
         )
-        label_sections.append((label_name, rows))
+        label_sections.append((parent_label, rows))
 
     tldr = []
     try:
