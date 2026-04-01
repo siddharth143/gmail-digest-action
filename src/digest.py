@@ -342,125 +342,99 @@ def _gmail_open_url(thread_id: str) -> str:
     return f"https://mail.google.com/mail/u/0/#all/{thread_id}"
 
 
-def _build_blocks(
+def _digest_header_blocks(*, title_suffix: str | None = None) -> list[dict[str, Any]]:
+    title = "Gmail digest" if not title_suffix else f"Gmail digest ({title_suffix})"
+    return [
+        {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}},
+        {"type": "divider"},
+    ]
+
+
+def _label_header_block(label_name: str, *, continued: bool) -> dict[str, Any]:
+    suffix = " (cont.)" if continued else ""
+    return {"type": "header", "text": {"type": "plain_text", "text": f"Label: {label_name}{suffix}", "emoji": False}}
+
+
+def _email_card_blocks(item: EmailItem, scored: ScoredSummary, source_label: str) -> list[dict[str, Any]]:
+    url = _gmail_open_url(item.thread_id)
+    urgency_dot = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}.get(scored.urgency, "⚪")
+    return [
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{_slack_escape(item.subject)}*"},
+            "fields": [
+                {"type": "mrkdwn", "text": f"*From*\n{_slack_escape(item.from_addr)}"},
+                {"type": "mrkdwn", "text": f"*Date*\n{_slack_escape(item.date)}"},
+                {"type": "mrkdwn", "text": f"*Sublabel*\n{_slack_escape(source_label)}"},
+                {"type": "mrkdwn", "text": f"*Score*\nRelevance {scored.relevance}/5 · {urgency_dot} {scored.urgency}"},
+            ],
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": _slack_escape(_truncate(scored.summary, 700))}},
+        {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Open in Gmail"}, "url": url}]},
+    ]
+
+
+def _build_slack_messages(
     label_sections: list[tuple[str, list[tuple[EmailItem, ScoredSummary, str]]]],
     *,
     tldr_lines: list[str] | None = None,
-    block_budget: int = 45,
-) -> list[dict[str, Any]]:
-    """Build Slack Block Kit payload (max 50 blocks per message)."""
-    blocks: list[dict[str, Any]] = [
-        {"type": "header", "text": {"type": "plain_text", "text": "Gmail digest", "emoji": True}},
-        {"type": "divider"},
-    ]
-    used = len(blocks)
+    max_blocks_per_message: int = 49,
+) -> list[list[dict[str, Any]]]:
+    """
+    Slack hard-limits blocks to 50 per message.
+    We split the digest into multiple messages instead of omitting emails.
+    """
+    messages: list[list[dict[str, Any]]] = []
+    blocks: list[dict[str, Any]] = _digest_header_blocks()
+
+    def flush() -> None:
+        nonlocal blocks
+        if blocks:
+            messages.append(blocks)
+        blocks = _digest_header_blocks(title_suffix=f"{len(messages) + 1}")
 
     for label_name, rows in label_sections:
-        if used + 1 > block_budget:
-            break
-        blocks.append(
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": f"Label: {label_name}", "emoji": False},
-            }
-        )
-        used += 1
+        label_started = False
+        continued = False
 
+        # Even if empty, show the header + placeholder.
         if not rows:
-            if used + 1 > block_budget:
-                break
-            blocks.append(
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": "_No qualifying emails for this period._",
-                    },
-                }
-            )
-            used += 1
+            if len(blocks) + 2 > max_blocks_per_message:
+                flush()
+            blocks.append(_label_header_block(label_name, continued=False))
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "_No qualifying emails for this period._"}})
             continue
 
-        omitted = 0
-        for idx, (item, scored, source_label) in enumerate(rows):
-            # Card uses up to 4 blocks: divider + meta + summary + actions.
-            if used + 4 > block_budget:
-                omitted = len(rows) - idx
-                break
-            url = _gmail_open_url(item.thread_id)
-            urgency_dot = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}.get(scored.urgency, "⚪")
-            blocks.append({"type": "divider"})
-            blocks.append(
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*{_slack_escape(item.subject)}*",
-                    },
-                    "fields": [
-                        {"type": "mrkdwn", "text": f"*From*\n{_slack_escape(item.from_addr)}"},
-                        {"type": "mrkdwn", "text": f"*Date*\n{_slack_escape(item.date)}"},
-                        {"type": "mrkdwn", "text": f"*Sublabel*\n{_slack_escape(source_label)}"},
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Score*\nRelevance {scored.relevance}/5 · {urgency_dot} {scored.urgency}",
-                        },
-                    ],
-                }
-            )
-            blocks.append(
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": _slack_escape(_truncate(scored.summary, 700)),
-                    },
-                }
-            )
-            blocks.append(
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Open in Gmail"},
-                            "url": url,
-                        }
-                    ],
-                }
-            )
-            used += 4
+        for item, scored, source_label in rows:
+            card = _email_card_blocks(item, scored, source_label)
+            needed = (0 if label_started else 1) + len(card)
+            if len(blocks) + needed > max_blocks_per_message:
+                flush()
+                continued = True
+                label_started = False
 
-        if omitted > 0 and used + 1 <= block_budget:
-            blocks.append(
-                {
-                    "type": "context",
-                    "elements": [
-                        {
-                            "type": "mrkdwn",
-                            "text": f"_{omitted} more email(s) in this label omitted (Slack block limit)._",
-                        }
-                    ],
-                }
-            )
-            used += 1
+            if not label_started:
+                blocks.append(_label_header_block(label_name, continued=continued))
+                label_started = True
+            blocks.extend(card)
 
-    if tldr_lines and used + 2 <= block_budget:
-        blocks.append({"type": "divider"})
-        used += 1
-        blocks.append(
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "TL;DR", "emoji": False},
-            }
-        )
-        used += 1
+    if tldr_lines:
+        tldr_blocks: list[dict[str, Any]] = [
+            {"type": "divider"},
+            {"type": "header", "text": {"type": "plain_text", "text": "TL;DR", "emoji": False}},
+        ]
         bullets = "\n".join(f"- {_slack_escape(x)}" for x in tldr_lines[:3] if x.strip())
-        if bullets and used + 1 <= block_budget:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": bullets}})
-            used += 1
+        if bullets:
+            tldr_blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": bullets}})
+        # If it doesn't fit, put TL;DR in a new message.
+        if len(blocks) + len(tldr_blocks) > max_blocks_per_message:
+            flush()
+        blocks.extend(tldr_blocks)
 
-    return blocks
+    if blocks:
+        messages.append(blocks)
+    return messages
 
 
 def _generate_tldr(model: Any, scored: list[tuple[str, EmailItem, ScoredSummary]]) -> list[str]:
@@ -614,10 +588,12 @@ def main() -> int:
     except Exception as e:
         _debug(f"[tldr] failed: {e}")
 
-    blocks = _build_blocks(label_sections, tldr_lines=tldr)
+    messages = _build_slack_messages(label_sections, tldr_lines=tldr)
     try:
-        if not _post_slack(cfg["slack_webhook"], blocks):
-            return 1
+        for i, blocks in enumerate(messages, start=1):
+            _debug(f"[slack] posting message {i}/{len(messages)} blocks={len(blocks)}")
+            if not _post_slack(cfg["slack_webhook"], blocks):
+                return 1
     except requests.RequestException as e:
         print(f"Slack request failed: {e}", file=sys.stderr)
         return 1
