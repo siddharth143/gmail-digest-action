@@ -134,9 +134,15 @@ def _debug(msg: str) -> None:
         print(msg, file=sys.stderr)
 
 
-def _list_message_refs(service: Any, label_id: str, days: int, max_count: int) -> list[dict[str, str]]:
-    q = f"newer_than:{days}d"
-    _debug(f"[gmail] list: label_id={label_id} q={q!r} max={max_count}")
+def _list_message_refs(
+    service: Any,
+    label_id: str,
+    *,
+    q: str | None,
+    max_count: int,
+    include_spam_trash: bool = False,
+) -> list[dict[str, str]]:
+    _debug(f"[gmail] list: label_id={label_id} q={(q or '')!r} max={max_count} include_spam_trash={include_spam_trash}")
     refs: list[dict[str, str]] = []
     page_token: str | None = None
     while len(refs) < max_count:
@@ -147,9 +153,10 @@ def _list_message_refs(service: Any, label_id: str, days: int, max_count: int) -
             .list(
                 userId="me",
                 labelIds=[label_id],
-                q=q,
+                q=(q or None),
                 maxResults=batch_size,
                 pageToken=page_token,
+                includeSpamTrash=include_spam_trash,
             )
         )
         resp = req.execute()
@@ -364,11 +371,12 @@ def main() -> int:
         try:
             label_id = _label_id_by_name(service, label_name)
             _debug(f"[gmail] resolved label {label_name!r} -> {label_id!r}")
+            q = f"newer_than:{cfg['date_window_days']}d"
             refs = _list_message_refs(
                 service,
                 label_id,
-                cfg["date_window_days"],
-                cfg["max_emails_per_label"],
+                q=q,
+                max_count=cfg["max_emails_per_label"],
             )
         except HttpError as e:
             print(f"Gmail API error for label {label_name!r}: {e}", file=sys.stderr)
@@ -379,6 +387,25 @@ def main() -> int:
         keyword_filtered = 0
         gemini_skipped = 0
         kept = 0
+        # If we fetched nothing, do a fast sanity check: does the label contain ANY mail?
+        # This helps distinguish "date window too small" vs "label has no messages".
+        if fetched == 0:
+            try:
+                any_refs = _list_message_refs(
+                    service,
+                    label_id,
+                    q=None,
+                    max_count=1,
+                )
+                print(
+                    "[label-check] "
+                    + f"{label_name!r}: any_in_label={bool(any_refs)} (no date filter)",
+                    file=sys.stderr,
+                )
+            except HttpError as e:
+                print(f"Gmail API error during label-check for {label_name!r}: {e}", file=sys.stderr)
+                return 1
+
         for ref in refs:
             mid = ref.get("id")
             if not mid:
