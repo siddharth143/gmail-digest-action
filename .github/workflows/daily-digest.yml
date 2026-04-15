@@ -8,6 +8,7 @@ on:
 
 jobs:
   digest:
+    if: ${{ false }}
     runs-on: ubuntu-latest
     # One GitHub Actions secret per key in .env.example (same name as the env var).
     env:
